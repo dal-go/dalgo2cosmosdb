@@ -135,6 +135,29 @@ func TestCompleteScopeFingerprintAndBoundedRetainedBinding(t *testing.T) {
 	var calls atomic.Int64
 	s := fixtureServer(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
+		// Receive the complete owned POST before replying/closing: an early TLS
+		// response can otherwise race the client's still-in-progress body write.
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 64*1024+1))
+		if err != nil || len(raw) > 64*1024 {
+			t.Error("owned large query body exceeded its bound or failed")
+			http.Error(w, "owned request refused", 400)
+			return
+		}
+		var request struct {
+			Query      string `json:"query"`
+			Parameters []struct {
+				Name  string `json:"name"`
+				Value string `json:"value"`
+			} `json:"parameters"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		var extra any
+		if r.Method != http.MethodPost || r.URL.Path != "/dbs/existing/colls/native/docs" || r.Header.Get("Content-Type") != "application/query+json" || r.Header.Get("x-ms-documentdb-isquery") != "true" || r.Header.Get("x-ms-max-item-count") != "1" || decoder.Decode(&request) != nil || decoder.Decode(&extra) != io.EOF || request.Query != "SELECT * FROM c WHERE c.x = @x" || len(request.Parameters) != 1 || request.Parameters[0].Name != "@x" || request.Parameters[0].Value != strings.Repeat("<", 8192) {
+			t.Error("owned large native query request contract changed")
+			http.Error(w, "owned request refused", 400)
+			return
+		}
 		w.Header().Set("x-ms-continuation", "owned-next")
 		fixtureJSON(w, 200, map[string]any{"Documents": []any{nativeDocument("a", "one")}, "_count": 1})
 	})
